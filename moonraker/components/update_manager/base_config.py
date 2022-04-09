@@ -1,4 +1,4 @@
-# Moonraker/Klipper update configuration
+# Moonraker/Klipper update configuration.
 #
 # Copyright (C) 2022  Eric Callahan <arksine.code@gmail.com>
 #
