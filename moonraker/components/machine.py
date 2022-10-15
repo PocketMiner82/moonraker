@@ -86,6 +86,7 @@ class Machine:
         dist_info['release_info'] = distro.distro_release_info()
         self.inside_container = False
         self.moonraker_service_info: Dict[str, Any] = {}
+        self.sudo_req_lock = asyncio.Lock()
         self._sudo_password: Optional[str] = None
         sudo_template = config.gettemplate("sudo_password", None)
         if sudo_template is not None:
@@ -178,6 +179,9 @@ class Machine:
         unit_name = svc_info.get("unit_name", "moonraker.service")
         return unit_name.split(".", 1)[0]
 
+    def validation_enabled(self) -> bool:
+        return self.validator.validation_enabled
+
     def get_system_provider(self):
         return self.sys_provider
 
@@ -197,6 +201,7 @@ class Machine:
             pass
 
     async def component_init(self):
+        await self.validator.validation_init()
         await self.sys_provider.initialize()
         if not self.inside_container:
             virt_info = await self.sys_provider.check_virt_status()
@@ -282,50 +287,53 @@ class Machine:
     async def _set_sudo_password(
         self, web_request: WebRequest
     ) -> Dict[str, Any]:
-        self._sudo_password = web_request.get_str("password")
-        if not await self.check_sudo_access():
-            self._sudo_password = None
-            raise self.server.error("Invalid password, sudo access was denied")
-        sudo_responses = ["Sudo password successfully set."]
-        restart: bool = False
-        failed: List[Tuple[SudoCallback, str]] = []
-        failed_msgs: List[str] = []
-        if self.sudo_requests:
-            while self.sudo_requests:
-                cb, msg = self.sudo_requests.pop(0)
-                try:
-                    ret = cb()
-                    if isinstance(ret, Awaitable):
-                        ret = await ret
-                    msg, need_restart = ret
-                    sudo_responses.append(msg)
-                    restart |= need_restart
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    failed.append((cb, msg))
-                    failed_msgs.append(str(e))
-            restart = False if len(failed) > 0 else restart
-            self.sudo_requests = failed
-            if not restart and len(sudo_responses) > 1:
-                # at least one successful response and not restarting
-                eventloop = self.server.get_event_loop()
-                eventloop.delay_callback(
-                    .05, self.server.send_event,
-                    "machine:sudo_alert",
-                    {
-                        "sudo_requested": self.sudo_requested,
-                        "request_messages": self.sudo_request_messages
-                    }
+        async with self.sudo_req_lock:
+            self._sudo_password = web_request.get_str("password")
+            if not await self.check_sudo_access():
+                self._sudo_password = None
+                raise self.server.error(
+                    "Invalid password, sudo access was denied"
                 )
-            if failed_msgs:
-                err_msg = "\n".join(failed_msgs)
-                raise self.server.error(err_msg, 500)
-            if restart:
-                self.restart_moonraker_service()
-                sudo_responses.append(
-                    "Moonraker is currently in the process of restarting."
-                )
+            sudo_responses = ["Sudo password successfully set."]
+            restart: bool = False
+            failed: List[Tuple[SudoCallback, str]] = []
+            failed_msgs: List[str] = []
+            if self.sudo_requests:
+                while self.sudo_requests:
+                    cb, msg = self.sudo_requests.pop(0)
+                    try:
+                        ret = cb()
+                        if isinstance(ret, Awaitable):
+                            ret = await ret
+                        msg, need_restart = ret
+                        sudo_responses.append(msg)
+                        restart |= need_restart
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        failed.append((cb, msg))
+                        failed_msgs.append(str(e))
+                restart = False if len(failed) > 0 else restart
+                self.sudo_requests = failed
+                if not restart and len(sudo_responses) > 1:
+                    # at least one successful response and not restarting
+                    eventloop = self.server.get_event_loop()
+                    eventloop.delay_callback(
+                        .05, self.server.send_event,
+                        "machine:sudo_alert",
+                        {
+                            "sudo_requested": self.sudo_requested,
+                            "request_messages": self.sudo_request_messages
+                        }
+                    )
+                if failed_msgs:
+                    err_msg = "\n".join(failed_msgs)
+                    raise self.server.error(err_msg, 500)
+                if restart:
+                    self.restart_moonraker_service()
+                    sudo_responses.append(
+                        "Moonraker is currently in the process of restarting."
+                    )
         return {
             "sudo_responses": sudo_responses,
             "is_restarting": restart
@@ -391,7 +399,9 @@ class Machine:
                 return False
         return True
 
-    async def exec_sudo_command(self, command: str) -> str:
+    async def exec_sudo_command(
+        self, command: str, tries: int = 1, timeout=2.
+    ) -> str:
         proc_input = None
         full_cmd = f"sudo {command}"
         if self._sudo_password is not None:
@@ -399,7 +409,8 @@ class Machine:
             full_cmd = f"sudo -S {command}"
         shell_cmd: SCMDComp = self.server.lookup_component("shell_command")
         return await shell_cmd.exec_cmd(
-            full_cmd, proc_input=proc_input, log_complete=False
+            full_cmd, proc_input=proc_input, log_complete=False, retries=tries,
+            timeout=timeout
         )
 
     def _get_sdcard_info(self) -> Dict[str, Any]:
@@ -861,7 +872,8 @@ class SystemdCliProvider(BaseProvider):
                 )
             prop_args = ",".join(properties)
             props: str = await self.shell_cmd.exec_cmd(
-                f"systemctl show -p {prop_args} {unit_name}"
+                f"systemctl show -p {prop_args} {unit_name}", retries=5,
+                timeout=10.
             )
             raw_props: Dict[str, Any] = {}
             lines = [p.strip() for p in props.split("\n") if p.strip]
@@ -1191,6 +1203,7 @@ class InstallValidator:
         self.data_path_valid = True
         self._sudo_requested = False
         self.announcement_id = ""
+        self.validation_enabled = False
 
     def _update_backup_path(self):
         str_time = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -1199,14 +1212,22 @@ class InstallValidator:
         elif not self.backup_path.exists():
             self.backup_path = self.data_path.joinpath(f"backup/{str_time}")
 
-    async def perform_validation(self) -> bool:
+    async def validation_init(self):
         db: MoonrakerDatabase = self.server.lookup_component("database")
         install_ver: int = await db.get_item(
             "moonraker", "validate_install.install_version", 0
         )
         if INSTALL_VERSION <= install_ver and not self.force_validation:
             logging.debug("Installation version in database up to date")
+            self.validation_enabled = False
+        else:
+            self.validation_enabled = True
+
+    async def perform_validation(self) -> bool:
+        db: MoonrakerDatabase = self.server.lookup_component("database")
+        if not self.validation_enabled:
             return False
+        fm: FileManager = self.server.lookup_component("file_manager")
         need_restart: bool = False
         has_error: bool = False
         try:
@@ -1219,12 +1240,15 @@ class InstallValidator:
         except ValidationError as ve:
             has_error = True
             self.server.add_warning(str(ve))
+            fm.disable_write_access()
         except Exception as e:
             has_error = True
             msg = f"Failed to validate {name}: {e}"
             logging.exception(msg)
             self.server.add_warning(msg, log=False)
+            fm.disable_write_access()
         else:
+            self.validation_enabled = False
             await db.insert_item(
                 "moonraker", "validate_install.install_version", INSTALL_VERSION
             )
@@ -1273,6 +1297,7 @@ class InstallValidator:
                 "must be updated manually."
             )
         if unit != "moonraker":
+            logging.info(f"Custom service file detected: {unit}")
             # Not using he default unit name
             if app_args["is_default_data_path"]:
                 # No datapath set, create a new, unique data path
@@ -1287,11 +1312,13 @@ class InstallValidator:
                         f"data path '{new_dp}' already exists.  Service file "
                         "must be updated manually."
                     )
+
                 # If the current path is bare we can remove it
                 if self._check_path_bare(self.data_path):
                     shutil.rmtree(self.data_path)
                 self.data_path = new_dp
                 if not self.data_path.exists():
+                    logging.info(f"New data path created at {self.data_path}")
                     self.data_path.mkdir()
                 # A non-default datapath requires successful update of the
                 # service
@@ -1359,8 +1386,13 @@ class InstallValidator:
             % (SERVICE_VERSION, user, src_path, env_file, sys.executable)
         )
         try:
-            await machine.exec_sudo_command(f"cp -f {tmp_svc} {svc_dest}")
-            await machine.exec_sudo_command("systemctl daemon-reload")
+            # write new environment
+            env_file.write_text(ENVIRONMENT % (src_path, cmd_args))
+            await machine.exec_sudo_command(
+                f"cp -f {tmp_svc} {svc_dest}", tries=5, timeout=60.)
+            await machine.exec_sudo_command(
+                "systemctl daemon-reload", tries=5, timeout=60.
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1371,9 +1403,8 @@ class InstallValidator:
             ) from None
         finally:
             tmp_svc.unlink()
-        # write new environment
-        env_file.write_text(ENVIRONMENT % (src_path, cmd_args))
         self.data_path_valid = True
+        self.sc_enabled = False
         return True
 
     def _check_path_bare(self, path: pathlib.Path) -> bool:
@@ -1399,7 +1430,7 @@ class InstallValidator:
         if not source_dir.is_dir():
             raise ValidationError(
                 f"Failed to link subfolder '{folder_name}' to source path "
-                f"'{source_dir}'.  The requusted path is not a valid directory."
+                f"'{source_dir}'.  The requested path is not a valid directory."
             )
         subfolder = self.data_path.joinpath(folder_name)
         if subfolder.is_symlink():
@@ -1469,8 +1500,18 @@ class InstallValidator:
             await cfg_source.write_config(cfg_bkp_path)
             # Create symbolic links for configured folders
             server_cfg = self.config["server"]
-            fm_cfg = self.config["file_manager"]
+
             db_cfg = self.config["database"]
+            # symlink database path first
+            db_path = db_cfg.get("database_path", None)
+            default_db = pathlib.Path("~/.moonraker_database").expanduser()
+            if db_path is None and default_db.exists():
+                self._link_data_subfolder("database", default_db)
+            elif db_path is not None:
+                self._link_data_subfolder("database", db_path)
+                cfg_source.remove_option("database", "database_path")
+
+            fm_cfg = self.config["file_manager"]
             cfg_path = fm_cfg.get("config_path", None)
             if cfg_path is None:
                 cfg_path = server_cfg.get("config_path", None)
@@ -1493,14 +1534,6 @@ class InstallValidator:
             if gc_path is not None:
                 self._link_data_subfolder("gcodes", gc_path)
                 db.delete_item("moonraker", "file_manager.gcode_path")
-
-            db_path = db_cfg.get("database_path", None)
-            default_db = pathlib.Path("~/.moonraker_database").expanduser()
-            if db_path is None and default_db.exists():
-                self._link_data_subfolder("database", default_db)
-            elif db_path is not None:
-                self._link_data_subfolder("database", db_path)
-                cfg_source.remove_option("database", "database_path")
 
             # Link individual files
             secrets_path = self.config["secrets"].get("secrets_path", None)
@@ -1547,7 +1580,7 @@ class InstallValidator:
         machine: Machine = self.server.lookup_component("machine")
         machine.register_sudo_request(
             self._on_password_received,
-            "Root access required to update Moonraker's systemd service."
+            "Sudo password required to update Moonraker's systemd service."
         )
         if not machine.public_ip:
             async def wrapper(pub_ip):
@@ -1616,6 +1649,7 @@ class InstallValidator:
         await db.insert_item(
             "moonraker", "validate_install.install_version", INSTALL_VERSION
         )
+        self.validation_enabled = False
         return "System update complete.", True
 
 def load_component(config: ConfigHelper) -> Machine:
