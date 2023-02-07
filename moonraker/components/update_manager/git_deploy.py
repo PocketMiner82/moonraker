@@ -264,7 +264,7 @@ GIT_REF_FMT = (
 )
 
 class GitRepo:
-    tag_r = re.compile(r"(v?\d+(?:\.\d+){0,2}(-(alpha|beta)(\.\d+)?)?)(-\d+)?")
+    tag_r = re.compile(r"(v?\d+(?:\.\d+){1,2}(-(alpha|beta)(\.\d+)?)?)(-\d+)?")
     def __init__(self,
                  cmd_helper: CommandHelper,
                  git_path: pathlib.Path,
@@ -584,6 +584,8 @@ class GitRepo:
         commit = tag = "?"
         try:
             commit = await self.rev_list("--tags --max-count=1")
+            if not commit:
+                return "?", "?"
             tag = await self.describe(f"--tags {commit}")
         except Exception:
             pass
@@ -944,6 +946,8 @@ class GitRepo:
             if core[0] == "v":
                 core = core[1:]
             base_ver = [int(part) for part in core.split(".")]
+            while len(base_ver) < 3:
+                base_ver.append(0)
             base_ver.append({"alpha": 0, "beta": 1}.get(ver_match.group(3), 2))
             base_ver.append(int(ver_match.group(5)[1:]))
         except Exception:
