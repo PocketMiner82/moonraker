@@ -39,7 +39,7 @@ from typing import (
 if TYPE_CHECKING:
     from ...server import Server
     from ...confighelper import ConfigHelper
-    from ...websockets import WebRequest
+    from ...common import WebRequest
     from ...klippy_connection import KlippyConnection
     from ..shell_command import ShellCommandFactory as SCMDComp
     from ..database import MoonrakerDatabase as DBComp
@@ -270,7 +270,7 @@ class UpdateManager:
             raise self.server.error("Update Refused: Klippy is printing")
         app: str = web_request.get_endpoint().split("/")[-1]
         if app == "client":
-            app = web_request.get('name')
+            app = web_request.get_str('name')
         if self.cmd_helper.is_app_updating(app):
             return f"Object {app} is currently being updated"
         updater = self.updaters.get(app, None)

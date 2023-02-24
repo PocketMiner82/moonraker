@@ -11,7 +11,6 @@ import struct
 import operator
 import logging
 from asyncio import Future, Task
-from io import BytesIO
 from functools import reduce
 from threading import Lock as ThreadLock
 import lmdb
@@ -34,7 +33,7 @@ from typing import (
 )
 if TYPE_CHECKING:
     from ..confighelper import ConfigHelper
-    from ..websockets import WebRequest
+    from ..common import WebRequest
     DBRecord = Union[int, float, bool, str, List[Any], Dict[str, Any]]
     DBType = Optional[DBRecord]
     _T = TypeVar("_T")

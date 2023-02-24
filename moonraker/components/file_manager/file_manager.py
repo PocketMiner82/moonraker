@@ -41,7 +41,7 @@ from typing import (
 if TYPE_CHECKING:
     from inotify_simple import Event as InotifyEvent
     from ...confighelper import ConfigHelper
-    from ...websockets import WebRequest
+    from ...common import WebRequest
     from ...klippy_connection import KlippyConnection
     from .. import database
     from .. import klippy_apis
@@ -619,11 +619,7 @@ class FileManager:
                     f"Cannot create archive at '{dest_path}'.  Parent "
                     "directory does not exist."
                 )
-            items: Union[str, List[str]] = web_request.get("items")
-            if isinstance(items, str):
-                items = [
-                    item.strip() for item in items.split(",") if item.strip()
-                ]
+            items = web_request.get_list("items")
             if not items:
                 raise self.server.error(
                     "At least one file or directory must be specified"

@@ -40,7 +40,7 @@ from typing import (
 
 if TYPE_CHECKING:
     from ..confighelper import ConfigHelper
-    from ..websockets import WebRequest
+    from ..common import WebRequest
     from ..app import MoonrakerApp
     from ..klippy_connection import KlippyConnection
     from .shell_command import ShellCommandFactory as SCMDComp
@@ -303,7 +303,7 @@ class Machine:
         self.server.get_event_loop().create_task(wrapper())
 
     async def _handle_service_request(self, web_request: WebRequest) -> str:
-        name: str = web_request.get('service')
+        name: str = web_request.get_str('service')
         action = web_request.get_endpoint().split('/')[-1]
         if name == self.unit_name:
             if action != "restart":
@@ -389,7 +389,7 @@ class Machine:
     async def _handle_sudo_info(
         self, web_request: WebRequest
     ) -> Dict[str, Any]:
-        check_access = web_request.get("check_access", False)
+        check_access = web_request.get_boolean("check_access", False)
         has_sudo: Optional[bool] = None
         if check_access:
             has_sudo = await self.check_sudo_access()

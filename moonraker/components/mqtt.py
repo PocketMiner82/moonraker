@@ -13,7 +13,7 @@ import pathlib
 import ssl
 from collections import deque
 import paho.mqtt.client as paho_mqtt
-from ..websockets import Subscribable, WebRequest, JsonRPC, APITransport
+from ..common import Subscribable, WebRequest, APITransport, JsonRPC
 
 # Annotation imports
 from typing import (
@@ -134,7 +134,7 @@ class ExtPahoClient(paho_mqtt.Client):
             sock.do_handshake()
 
             if verify_host:
-                ssl.match_hostname(sock.getpeercert(), self._host)
+                ssl.match_hostname(sock.getpeercert(), self._host)  # type: ignore
 
         if self._transport == "websockets":
             sock.settimeout(self._keepalive)
